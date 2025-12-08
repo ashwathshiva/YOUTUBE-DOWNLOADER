@@ -1,14 +1,17 @@
-from flask import Flask, request, render_template_string, send_file, Response, jsonify
+from flask import Flask, request, render_template_string, send_file, Response
 import yt_dlp
 import os
 import tempfile
 import threading
 import time
 import shutil
-from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 progress = {"text": "Ready", "percent": 0}
+
+# Render PORT binding
+port = int(os.environ.get('PORT', 5000))
+app.run(host='0.0.0.0', port=port, threaded=True)
 
 HTML = '''
 <!DOCTYPE html>
@@ -34,6 +37,7 @@ HTML = '''
 
 <script>
     const es = new EventSource("/progress");
+    es.onerror = () => es.close();
     es.onmessage = e => {
         if (e.data === "DONE") {
             document.getElementById("status").innerText = "100% Complete! Sending file...";
@@ -80,8 +84,6 @@ def index():
     global progress
     if request.method == 'POST':
         url = request.form['url'].strip()
-        if not url.startswith('https://www.youtube.com/'):
-            return "ERROR: Please enter a valid YouTube URL.", 400
         action = request.form.get('action', 'mp4')
         progress = {"text": "Starting...", "percent": 0}
 
@@ -116,12 +118,11 @@ def index():
             except Exception as e:
                 progress["text"] = f"ERROR: {str(e)}"
                 progress["percent"] = 0
-                yield f"data: ERROR: {str(e)}\n\n"
 
         threading.Thread(target=download, daemon=True).start()
 
-        # Wait for file or error
-        time.sleep(5)  # Give it time to start
+        # Wait for file
+        time.sleep(5)
         files = [f for f in os.listdir(temp_dir) if f.endswith(('.mp4', '.mp3')) and os.path.getsize(os.path.join(temp_dir, f)) > 100*1024]
         if files:
             final_file = os.path.join(temp_dir, files[0])
@@ -135,4 +136,4 @@ def index():
     return render_template_string(HTML)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), threaded=True)
+    app.run(host='0.0.0.0', port=port, threaded=True)
