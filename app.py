@@ -1,10 +1,11 @@
-from flask import Flask, request, render_template_string, send_file, Response
+from flask import Flask, request, render_template_string, send_file, Response, jsonify
 import yt_dlp
 import os
 import tempfile
 import threading
 import time
 import shutil
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 progress = {"text": "Ready", "percent": 0}
@@ -19,6 +20,7 @@ HTML = '''
     .mp4{background:#ff0000;}.mp3{background:#00c853;}
     .bar{height:50px;background:#333;border-radius:10px;overflow:hidden;margin:20px auto;width:80%;max-width:600px;}
     .fill{height:100%;width:0%;background:linear-gradient(90deg,#ff0000,#ffff00);text-align:center;line-height:50px;font-weight:bold;transition:0.4s;}
+    .error {color: red; margin: 20px;}
 </style></head><body>
 <h1>YouTube Downloader</h1>
 <form method="POST">
@@ -28,6 +30,7 @@ HTML = '''
 </form>
 <div class="bar"><div class="fill" id="fill">0%</div></div>
 <div id="status">Ready</div>
+<div id="error" class="error"></div>
 
 <script>
     const es = new EventSource("/progress");
@@ -36,6 +39,9 @@ HTML = '''
             document.getElementById("status").innerText = "100% Complete! Sending file...";
             document.getElementById("fill").style.width = "100%";
             document.getElementById("fill").innerText = "100%";
+            es.close();
+        } else if (e.data.startsWith("ERROR:")) {
+            document.getElementById("error").innerText = e.data;
             es.close();
         } else {
             const d = JSON.parse(e.data);
@@ -49,29 +55,22 @@ HTML = '''
 '''
 
 def progress_hook(d):
-    global progress
     if d['status'] == 'downloading':
         try:
-            percent_str = d.get('_percent_str', '0%').replace('%', '').strip()
-            p = int(float(percent_str))
-            progress["percent"] = p
-            speed = d.get('_speed_str', '??')
-            eta = d.get('_eta_str', '??')
-            progress["text"] = f"Downloading... {p}% • {speed} • ETA {eta}"
+            p = int(float(d['_percent_str'].replace('%','').strip()))
         except:
-            pass
+            p = progress["percent"]
+        progress["percent"] = p
+        progress["text"] = f"Downloading... {p}% • {d.get('_speed_str','')} • ETA {d.get('_eta_str','')}"
     elif d['status'] == 'finished':
-        progress["text"] = "Finalizing file..."
+        progress["text"] = "Processing file (this can take a minute)..."
         progress["percent"] = 99
 
 @app.route('/progress')
 def stream():
     def gen():
-        last = -1
         while progress["percent"] < 99:
-            if progress["percent"] != last:      # only send when changed
-                yield f"data: {{\"text\":\"{progress['text']}\",\"percent\":{progress['percent']}}}\n\n"
-                last = progress["percent"]
+            yield f"data: {{\"text\":\"{progress['text']}\",\"percent\":{progress['percent']}}}\n\n"
             time.sleep(0.5)
         yield "data: DONE\n\n"
     return Response(gen(), mimetype='text/event-stream')
@@ -81,61 +80,59 @@ def index():
     global progress
     if request.method == 'POST':
         url = request.form['url'].strip()
+        if not url.startswith('https://www.youtube.com/'):
+            return "ERROR: Please enter a valid YouTube URL.", 400
         action = request.form.get('action', 'mp4')
-        progress = {"text": "Preparing...", "percent": 0}
+        progress = {"text": "Starting...", "percent": 0}
 
         temp_dir = os.path.join(tempfile.gettempdir(), f"yt_{int(time.time()*1000)}")
         os.makedirs(temp_dir, exist_ok=True)
 
         def download():
-            # THE MAGIC SETTINGS THAT FIX EVERYTHING
-            base_opts = {
-                'format': 'bestaudio/best' if action == 'mp3' else 'bestvideo+bestaudio/best',
-                'outtmpl': os.path.join(temp_dir, '%(title)s.f%(format_id)s.%(ext)s'),
-                'merge_output_format': 'mp4' if action == 'mp4' else None,
-                'postprocessors': [],
-                'progress_hooks': [progress_hook],
-                'quiet': False,
-                'no_warnings': False,
-                'continuedl': True,
-                'retries': 999,
-                'fragment_retries': 999,
-                'ffmpeg_location': os.path.dirname(__file__),
-            }
+            try:
+                base_opts = {
+                    'format': 'bestaudio/best' if action == 'mp3' else 'bestvideo+bestaudio/best',
+                    'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+                    'progress_hooks': [progress_hook],
+                    'quiet': False,
+                    'no_warnings': False,
+                    'continuedl': True,
+                    'retries': 10,
+                }
 
-            if action == 'mp3':
-                base_opts['postprocessors'] = [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }]
-                base_opts['keepvideo'] = False
+                if action == 'mp3':
+                    base_opts['postprocessors'] = [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }]
+                    base_opts['keepvideo'] = False
+                else:
+                    base_opts['merge_output_format'] = 'mp4'
 
-            with yt_dlp.YoutubeDL(base_opts) as ydl:
-                ydl.download([url])
+                with yt_dlp.YoutubeDL(base_opts) as ydl:
+                    ydl.download([url])
+                progress["percent"] = 100
+            except Exception as e:
+                progress["text"] = f"ERROR: {str(e)}"
+                progress["percent"] = 0
+                yield f"data: ERROR: {str(e)}\n\n"
 
         threading.Thread(target=download, daemon=True).start()
 
-        # Wait for the FINAL file (mp3 or mp4) — this is the key!
-        target_ext = '.mp3' if action == 'mp3' else '.mp4'
-        while True:
-            done_files = [f for f in os.listdir(temp_dir) if f.endswith(target_ext)]
-            if done_files:
-                final_file = os.path.join(temp_dir, done_files[0])
-                # Extra safety: wait until file stops growing
-                size1 = os.path.getsize(final_file)
-                time.sleep(3)
-                size2 = os.path.getsize(final_file)
-                if size1 == size2 and size2 > 500*1024:  # stopped growing + >500KB
-                    break
-            time.sleep(1)
-
-        resp = send_file(final_file, as_attachment=True)
-        threading.Thread(target=lambda: [time.sleep(20), shutil.rmtree(temp_dir, ignore_errors=True)]).start()
-        return resp
+        # Wait for file or error
+        time.sleep(5)  # Give it time to start
+        files = [f for f in os.listdir(temp_dir) if f.endswith(('.mp4', '.mp3')) and os.path.getsize(os.path.join(temp_dir, f)) > 100*1024]
+        if files:
+            final_file = os.path.join(temp_dir, files[0])
+            resp = send_file(final_file, as_attachment=True)
+            threading.Thread(target=lambda: [time.sleep(10), shutil.rmtree(temp_dir, ignore_errors=True)]).start()
+            return resp
+        else:
+            return "ERROR: Download failed. Check URL or try again.", 500
 
     progress = {"text": "Ready", "percent": 0}
     return render_template_string(HTML)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), threaded=True)
